@@ -20,6 +20,9 @@ public:
     std::string GetData(const char* path);
     //获取指定节点的子节点列表
     std::vector<std::string> GetChildren(const char* path);
+    // 获取子节点并设置 watcher 监听子节点变化
+    std::vector<std::string> GetChildrenWithWatcher(const char* path,
+        watcher_fn watcher, void* ctx);
 private:
     //Zk的客户端句柄
     zhandle_t* m_zhandle;

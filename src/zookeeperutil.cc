@@ -92,12 +92,14 @@ std::string ZkClient::GetData(const char *path) {
     return "";  // 默认返回空字符串
 }
 
-// 获取ZooKeeper节点的子节点列表
-std::vector<std::string> ZkClient::GetChildren(const char *path) {
+
+// 获取子节点并设置 watcher 监听子节点变化（watcher 为一次性，触发后需重新注册）
+std::vector<std::string> ZkClient::GetChildrenWithWatcher(const char *path,
+    watcher_fn watcher, void* ctx) {
     struct String_vector children;
     std::vector<std::string> result;
 
-    int flag = zoo_get_children(m_zhandle, path, 0, &children);
+    int flag = zoo_wget_children(m_zhandle, path, watcher, ctx, &children);
     if (flag != ZOK) {
         return result;
     }

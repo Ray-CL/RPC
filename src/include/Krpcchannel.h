@@ -7,17 +7,13 @@
 #include <vector>
 #include <chrono>
 #include <memory>
+#include <unordered_map>
 
 class KrpcChannel : public google::protobuf::RpcChannel
 {
 public:
     KrpcChannel(bool connectNow);
-    virtual ~KrpcChannel()
-    {
-          if (m_clientfd >= 0) {
-        close(m_clientfd);
-    }  
-    }
+    virtual ~KrpcChannel();
     void CallMethod(const ::google::protobuf::MethodDescriptor *method,
                     ::google::protobuf::RpcController *controller,
                     const ::google::protobuf::Message *request,
@@ -31,7 +27,8 @@ private:
         std::chrono::steady_clock::time_point last_failed = std::chrono::steady_clock::time_point::min();
     };
 
-    int m_clientfd; // 存放客户端套接字
+    // 连接池，key = "ip:port"
+    std::unordered_map<std::string, int> m_conn_pool;
     std::string service_name;
     std::string m_ip;
     uint16_t m_port;
@@ -42,6 +39,9 @@ private:
     std::chrono::steady_clock::time_point m_last_refresh_time = std::chrono::steady_clock::time_point::min();
     std::unique_ptr<ZkClient> m_zkclient;
 
+    // watcher 触发的脏标记，下次调用时刷新
+    bool m_providers_dirty = true;
+
     bool newConnect(const char *ip, uint16_t port);
     void EnsureZkClient();
     bool RefreshProviders(ZkClient *zkclient, const std::string &service_name, const std::string &method_name);
@@ -49,7 +49,15 @@ private:
     void MarkProviderFailed(const std::string &ip, uint16_t port);
     bool ConnectToAvailableProvider(ZkClient *zkclient, const std::string &service_name, const std::string &method_name);
     bool ProviderAlive(const ProviderInfo &provider) const;
-       // 新增：确保读取指定长度的数据，解决TCP拆包
     ssize_t recv_exact(int fd, char* buf, size_t size);
+
+    // 连接池操作
+    std::string PoolKey(const std::string &ip, uint16_t port) const;
+    int GetPooledFd(const std::string &ip, uint16_t port);
+    void AddToPool(const std::string &ip, uint16_t port, int fd);
+    void RemoveFromPool(const std::string &ip, uint16_t port);
+
+    // ZK 子节点变化 watcher 回调
+    static void ChildWatcher(zhandle_t *zh, int type, int state, const char *path, void *watcherCtx);
 };
 #endif
