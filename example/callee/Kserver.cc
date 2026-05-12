@@ -39,6 +39,18 @@ public:
         code->set_errcode(0);  // 设置错误码为 0，表示成功
         code->set_errmsg("");  // 设置错误信息为空
         response->set_success(login_result);  // 设置登录结果
+    //执行完 UserService::Login 后，response 里的内容：
+
+
+    // LoginResponse {
+    //     result: ResultCode {
+    //         errcode: 0       // 0 表示成功
+    //         errmsg:  ""      // 空，没错误
+    //     }
+    //     success: true         // Login(name, pwd) 返回了 true
+    // }
+    // 然后 done->Run() 把上面这个序列化，加上长度头，发回客户端：
+    // [4B: 数据总长度] [序列化后的 LoginResponse{errcode=0, errmsg="", success=true}]
 
         // 执行回调操作，框架会自动将响应序列化并发送给调用者
         done->Run();
@@ -52,7 +64,17 @@ int main(int argc, char **argv) {
     // 创建一个 RPC 服务提供者对象
     KrpcProvider provider;
 
-    // 将 UserService 对象发布到 RPC 节点上，使其可以被远程调用
+    //NotifyService 不涉及网络，只是把服务对象和方法信息存到内存里的 service_map
+    //     存完后 service_map 长这样：
+    // service_map = {
+    //     "Kuser.UserServiceRpc" → {
+    //         service:  UserService对象指针,
+    //         method_map: {
+    //             "Login"    → MethodDescriptor(Login),
+    //             "Register" → MethodDescriptor(Register)
+    //         }
+    //     }
+    // }
     provider.NotifyService(new UserService());
 
     // 启动 RPC 服务节点，进入阻塞状态，等待远程的 RPC 调用请求
