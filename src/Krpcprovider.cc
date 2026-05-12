@@ -171,10 +171,9 @@ void KrpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn, muduo::ne
         google::protobuf::Message *response = service->GetResponsePrototype(method).New();
 
         google::protobuf::Closure *done = google::protobuf::NewCallback<KrpcProvider,
-                                                                        const muduo::net::TcpConnectionPtr &,
-                                                                        google::protobuf::Message *>(this,
-                                                                                                     &KrpcProvider::SendRpcResponse,
-                                                                                                     conn, response);
+        const muduo::net::TcpConnectionPtr &,google::protobuf::Message *>
+        (this,&KrpcProvider::SendRpcResponse, conn, response);
+        
         service->CallMethod(method, nullptr, request, response, done);
     }
 }

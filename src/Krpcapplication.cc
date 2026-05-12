@@ -59,3 +59,5 @@ void KrpcApplication::deleteInstance() {
 Krpcconfig& KrpcApplication::GetConfig() {
     return m_config;
 }
+
+
