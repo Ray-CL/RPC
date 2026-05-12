@@ -21,19 +21,19 @@ void send_request(int thread_id, std::atomic<int> &success_count, std::atomic<in
     Kuser::LoginResponse response;
     Krpccontroller controller;  // 创建控制器对象，用于处理 RPC 调用过程中的错误
     for (int i = 0; i < requests_per_thread; ++i) {
+        controller.Reset();
+        response.Clear();
+
         // 调用远程的 Login 方法
         stub.Login(&controller, &request, &response, nullptr);
 
         // 检查 RPC 调用是否成功
         if (controller.Failed()) {  // 如果调用失败
-            std::cout << controller.ErrorText() << std::endl;  // 打印错误信息
             fail_count++;  // 失败计数加 1
         } else {  // 如果调用成功
-            if (int{} == response.result().errcode()) {  // 检查响应中的错误码
-                std::cout << "rpc login response success:" << response.success() << std::endl;  // 打印成功信息
+            if (0 == response.result().errcode()) {  // 检查响应中的错误码
                 success_count++;  // 成功计数加 1
             } else {  // 如果响应中有错误
-                std::cout << "rpc login response error : " << response.result().errmsg() << std::endl;  // 打印错误信息
                 fail_count++;  // 失败计数加 1
             }
         }
@@ -47,8 +47,8 @@ int main(int argc, char **argv) {
     // 创建日志对象
     KrpcLogger logger("MyRPC");
 
-const int thread_count = 100;      // 线程数改为 100
-const int requests_per_thread = 5000; // 每个线程发 5000 次请求
+    const int thread_count = 8;      // 线程数改为 100
+    const int requests_per_thread = 5000; // 每个线程发 5000 次请求
 
     std::vector<std::thread> threads;  // 存储线程对象的容器
     std::atomic<int> success_count(0); // 成功请求的计数器

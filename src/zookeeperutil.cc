@@ -87,7 +87,24 @@ std::string ZkClient::GetData(const char *path) {
         LOG(ERROR) << "zoo_get error";
         return "";  // 返回空字符串
     } else {  // 获取成功
-        return buf;  // 返回节点数据
+        return std::string(buf, bufferlen);  // 返回节点数据
     }
     return "";  // 默认返回空字符串
+}
+
+// 获取ZooKeeper节点的子节点列表
+std::vector<std::string> ZkClient::GetChildren(const char *path) {
+    struct String_vector children;
+    std::vector<std::string> result;
+
+    int flag = zoo_get_children(m_zhandle, path, 0, &children);
+    if (flag != ZOK) {
+        return result;
+    }
+
+    for (int i = 0; i < children.count; ++i) {
+        result.emplace_back(children.data[i]);
+    }
+    deallocate_String_vector(&children);
+    return result;
 }

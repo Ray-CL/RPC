@@ -4,7 +4,11 @@
 #include "Krpcapplication.h"
 #include "Krpccontroller.h"
 #include "memory"
+#include <algorithm>
+#include <chrono>
 #include <errno.h>
+#include <mutex>
+#include <random>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -36,105 +40,107 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
                              ::google::protobuf::Message *response,
                              ::google::protobuf::Closure *done)
 {
-    if (-1 == m_clientfd) {  // 如果客户端socket未初始化
-        // 获取服务对象名和方法名
-        const google::protobuf::ServiceDescriptor *sd = method->service();
-        service_name = sd->name();  // 服务名
-        method_name = method->name();  // 方法名
+    // 获取服务对象名和方法名
+    const google::protobuf::ServiceDescriptor *sd = method->service();
+    service_name = sd->name();  // 服务名
+    method_name = method->name();  // 方法名
 
-        // 客户端需要查询ZooKeeper，找到提供该服务的服务器地址
-        ZkClient zkCli;
-        zkCli.Start();  // 连接ZooKeeper服务器
-        std::string host_data = QueryServiceHost(&zkCli, service_name, method_name, m_idx);  // 查询服务地址
-        m_ip = host_data.substr(0, m_idx);  // 从查询结果中提取IP地址
-        std::cout << "ip: " << m_ip << std::endl;
-        m_port = atoi(host_data.substr(m_idx + 1, host_data.size() - m_idx).c_str());  // 从查询结果中提取端口号
-        std::cout << "port: " << m_port << std::endl;
+    // 客户端需要查询ZooKeeper，找到提供该服务的服务器地址
+    EnsureZkClient();
 
-        // 尝试连接服务器
-        auto rt = newConnect(m_ip.c_str(), m_port);
-        if (!rt) {
-            LOG(ERROR) << "connect server error";  // 连接失败，记录错误日志
-            return;
-        } else {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (-1 == m_clientfd) {
+            if (!ConnectToAvailableProvider(m_zkclient.get(), service_name, method_name)) {
+                controller->SetFailed("no available service provider");
+                return;
+            }
             LOG(INFO) << "connect server success";  // 连接成功，记录日志
         }
-    }  // endif
 
-     // 2. 序列化请求参数
-    std::string args_str;
-    if (!request->SerializeToString(&args_str)) {
-        controller->SetFailed("serialize request fail");
+        // 2. 序列化请求参数
+        std::string args_str;
+        if (!request->SerializeToString(&args_str)) {
+            controller->SetFailed("serialize request fail");
+            return;
+        }
+
+        // 3. 构建协议头
+        Krpc::RpcHeader krpcheader;
+        krpcheader.set_service_name(service_name);
+        krpcheader.set_method_name(method_name);
+        krpcheader.set_args_size(args_str.size());
+
+        std::string rpc_header_str;
+        if (!krpcheader.SerializeToString(&rpc_header_str)) {
+            controller->SetFailed("serialize rpc header error!");
+            return;
+        }
+
+        // 4. 打包数据发送
+        // 格式：[4B Total Len] + [4B Header Len] + [Header] + [Args]
+
+        uint32_t header_size = rpc_header_str.size();
+        uint32_t total_len = 4 + header_size + args_str.size(); // Total Len 包含 HeaderLen(4) + Header + Body
+
+        // 转网络字节序
+        uint32_t net_total_len = htonl(total_len);
+        uint32_t net_header_len = htonl(header_size);
+
+        std::string send_rpc_str;
+        send_rpc_str.reserve(4 + 4 + header_size + args_str.size());
+        
+        send_rpc_str.append((char*)&net_total_len, 4);
+        send_rpc_str.append((char*)&net_header_len, 4);
+        send_rpc_str.append(rpc_header_str);
+        send_rpc_str.append(args_str);
+
+        // 发送
+        if (-1 == send(m_clientfd, send_rpc_str.c_str(), send_rpc_str.size(), 0)) {
+            MarkProviderFailed(m_ip, m_port);
+            close(m_clientfd);
+            m_clientfd = -1; // 重置
+            continue;
+        }
+
+        // 5. 接收响应
+        // 格式：[4B Total Len] + [Response Data]
+        
+        // A. 先读4字节长度头
+        uint32_t response_len = 0;
+        if (recv_exact(m_clientfd, (char*)&response_len, 4) != 4) {
+            MarkProviderFailed(m_ip, m_port);
+            close(m_clientfd);
+            m_clientfd = -1;
+            continue;
+        }
+        response_len = ntohl(response_len); // 转回主机字节序
+
+        // B. 根据长度读取Body
+        std::vector<char> recv_buf(response_len);
+        if (recv_exact(m_clientfd, recv_buf.data(), response_len) != response_len) {
+            MarkProviderFailed(m_ip, m_port);
+            close(m_clientfd);
+            m_clientfd = -1;
+            continue;
+        }
+
+        // 6. 反序列化响应
+        if (!response->ParseFromArray(recv_buf.data(), response_len)) {
+            MarkProviderFailed(m_ip, m_port);
+            close(m_clientfd);
+            m_clientfd = -1;
+            continue;
+        }
+
+        if (m_providers.size() > 1) {
+            close(m_clientfd);
+            m_clientfd = -1;
+        }
         return;
     }
 
-    // 3. 构建协议头
-    Krpc::RpcHeader krpcheader;
-    krpcheader.set_service_name(service_name);
-    krpcheader.set_method_name(method_name);
-    krpcheader.set_args_size(args_str.size());
-
-    std::string rpc_header_str;
-    if (!krpcheader.SerializeToString(&rpc_header_str)) {
-        controller->SetFailed("serialize rpc header error!");
-        return;
-    }
-
-    // 4. 打包数据发送
-    // 格式：[4B Total Len] + [4B Header Len] + [Header] + [Args]
-    
-    uint32_t header_size = rpc_header_str.size();
-    uint32_t total_len = 4 + header_size + args_str.size(); // Total Len 包含 HeaderLen(4) + Header + Body
-    
-    // 转网络字节序
-    uint32_t net_total_len = htonl(total_len);
-    uint32_t net_header_len = htonl(header_size);
-
-    std::string send_rpc_str;
-    send_rpc_str.reserve(4 + 4 + header_size + args_str.size());
-    
-    send_rpc_str.append((char*)&net_total_len, 4);
-    send_rpc_str.append((char*)&net_header_len, 4);
-    send_rpc_str.append(rpc_header_str);
-    send_rpc_str.append(args_str);
-
-    // 发送
-    if (-1 == send(m_clientfd, send_rpc_str.c_str(), send_rpc_str.size(), 0)) {
-        close(m_clientfd);
-        m_clientfd = -1; // 重置
-        controller->SetFailed("send error");
-        return;
-    }
-
-    // 5. 接收响应
-    // 格式：[4B Total Len] + [Response Data]
-    
-    // A. 先读4字节长度头
-    uint32_t response_len = 0;
-    if (recv_exact(m_clientfd, (char*)&response_len, 4) != 4) {
-        close(m_clientfd);
-        m_clientfd = -1;
-        controller->SetFailed("recv response length error");
-        return;
-    }
-    response_len = ntohl(response_len); // 转回主机字节序
-
-    // B. 根据长度读取Body
-    std::vector<char> recv_buf(response_len);
-    if (recv_exact(m_clientfd, recv_buf.data(), response_len) != response_len) {
-        close(m_clientfd);
-        m_clientfd = -1;
-        controller->SetFailed("recv response body error");
-        return;
-    }
-
-    // 6. 反序列化响应
-    if (!response->ParseFromArray(recv_buf.data(), response_len)) {
-        close(m_clientfd);
-        m_clientfd = -1;
-        controller->SetFailed("parse response error");
-        return;
-    }
+    controller->SetFailed("rpc call failed after retrying providers");
+    return;
 }
 
 // 创建新的socket连接
@@ -167,28 +173,142 @@ bool KrpcChannel::newConnect(const char *ip, uint16_t port) {
     return true;
 }
 
-// 从ZooKeeper查询服务地址
-std::string KrpcChannel::QueryServiceHost(ZkClient *zkclient, std::string service_name, std::string method_name, int &idx) {
-    std::string method_path = "/" + service_name + "/" + method_name;  // 构造ZooKeeper路径
-    std::cout << "method_path: " << method_path << std::endl;
-
-    std::unique_lock<std::mutex> lock(g_data_mutx);  // 加锁，保证线程安全
-    std::string host_data_1 = zkclient->GetData(method_path.c_str());  // 从ZooKeeper获取数据
-    lock.unlock();  // 解锁
-
-    if (host_data_1 == "") {  // 如果未找到服务地址
-        LOG(ERROR) << method_path + " is not exist!";  // 记录错误日志
-        return " ";
+bool KrpcChannel::ProviderAlive(const ProviderInfo &provider) const {
+    if (provider.alive) {
+        return true;
     }
-
-    idx = host_data_1.find(":");  // 查找IP和端口的分隔符
-    if (idx == -1) {  // 如果分隔符不存在
-        LOG(ERROR) << method_path + " address is invalid!";  // 记录错误日志
-        return " ";
-    }
-
-    return host_data_1;  // 返回服务地址
+    auto now = std::chrono::steady_clock::now();
+    return now - provider.last_failed >= std::chrono::seconds(3);
 }
+
+void KrpcChannel::MarkProviderFailed(const std::string &ip, uint16_t port) {
+    for (auto &provider : m_providers) {
+        if (provider.ip == ip && provider.port == port) {
+            provider.alive = false;
+            provider.last_failed = std::chrono::steady_clock::now();
+            break;
+        }
+    }
+}
+
+bool KrpcChannel::RefreshProviders(ZkClient *zkclient, const std::string &service_name, const std::string &method_name) {
+    std::string method_path = "/" + service_name + "/" + method_name;
+    std::vector<std::string> children;
+
+    {
+        std::unique_lock<std::mutex> lock(g_data_mutx);
+        children = zkclient->GetChildren(method_path.c_str());
+    }
+
+    if (children.empty()) {
+        return false;
+    }
+
+    std::vector<ProviderInfo> next_providers;
+    for (auto &child : children) {
+        std::string child_path = method_path + "/" + child;
+        std::string host_data;
+        {
+            std::unique_lock<std::mutex> lock(g_data_mutx);
+            host_data = zkclient->GetData(child_path.c_str());
+        }
+        if (host_data.empty()) {
+            continue;
+        }
+        int pos = host_data.find(":");
+        if (pos == -1) {
+            continue;
+        }
+        ProviderInfo provider;
+        provider.ip = host_data.substr(0, pos);
+        provider.port = atoi(host_data.substr(pos + 1).c_str());
+        for (auto &old : m_providers) {
+            if (old.ip == provider.ip && old.port == provider.port) {
+                provider.alive = old.alive;
+                provider.last_failed = old.last_failed;
+                break;
+            }
+        }
+        next_providers.emplace_back(std::move(provider));
+    }
+
+    if (next_providers.empty()) {
+        return false;
+    }
+
+    m_providers = std::move(next_providers);
+    m_last_refresh_time = std::chrono::steady_clock::now();
+    if (m_provider_index >= m_providers.size()) {
+        m_provider_index = 0;
+    }
+    return true;
+}
+//随机选择一个存活或者经过故障隔离的节点
+bool KrpcChannel::SelectProvider(std::string &ip, uint16_t &port) {
+    if (m_providers.empty()) {
+        return false;
+    }
+
+    std::vector<size_t> alive_indices;
+    for (size_t i = 0; i < m_providers.size(); ++i) {
+        if (ProviderAlive(m_providers[i])) {
+            alive_indices.push_back(i);
+        }
+    }
+    if (alive_indices.empty()) {
+        return false;
+    }
+
+    static thread_local std::mt19937 gen((std::random_device())());
+    std::uniform_int_distribution<size_t> dist(0, alive_indices.size() - 1);
+    size_t chosen_index = alive_indices[dist(gen)];
+    ip = m_providers[chosen_index].ip;
+    port = m_providers[chosen_index].port;
+    m_provider_index = (chosen_index + 1) % m_providers.size();
+    return true;
+}
+
+void KrpcChannel::EnsureZkClient() {
+    if (!m_zkclient) {
+        m_zkclient.reset(new ZkClient());
+        m_zkclient->Start();
+    }
+}
+
+bool KrpcChannel::ConnectToAvailableProvider(ZkClient *zkclient, const std::string &service_name, const std::string &method_name) {
+    auto now = std::chrono::steady_clock::now();
+    if (m_providers.empty() || now - m_last_refresh_time > std::chrono::seconds(10)) {
+        if (!RefreshProviders(zkclient, service_name, method_name)) {
+            return false;
+        }
+    }
+
+    std::string ip;
+    uint16_t port;
+    while (SelectProvider(ip, port)) {
+        if (newConnect(ip.c_str(), port)) {
+            m_ip = ip;
+            m_port = port;
+            return true;
+        }
+        MarkProviderFailed(ip, port);
+    }
+
+    // 再刷新一次列表，防止旧列表全部被标记失败
+    if (RefreshProviders(zkclient, service_name, method_name)) {
+        while (SelectProvider(ip, port)) {
+            if (newConnect(ip.c_str(), port)) {
+                m_ip = ip;
+                m_port = port;
+                return true;
+            }
+            MarkProviderFailed(ip, port);
+        }
+    }
+
+    return false;
+}
+
 
 // 构造函数，支持延迟连接
 KrpcChannel::KrpcChannel(bool connectNow) : m_clientfd(-1), m_idx(0) {
