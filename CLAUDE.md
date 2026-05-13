@@ -26,20 +26,10 @@ cmake .. && make -j$(nproc)
 
 # 2. 启动服务端（需要配置文件，多个实例用不同端口）
 cd bin
-./server -i test.conf      # 端口 8000
-./server -i test1.conf     # 端口 8001（如需多实例）
-./server -i test2.conf     # 端口 8002（如需多实例）
-
-# 3. 启动客户端（压力测试，8线程 × 5000请求，可多进程并发）
-./client -i test.conf
-
-
-
-cd bin
 ./server -i ./test.conf &    # 后台启动，端口 8000
-./server -i ./test1.conf &   # 后台启动，端口 8001
-./server -i ./test2.conf &   # 后台启动，端口 8002
-./client -i ./test.conf      # 前台启动客户端
+./server -i ./test1.conf &   # 后台启动，端口 8001（如需多实例）
+./server -i ./test2.conf &   # 后台启动，端口 8002（如需多实例）
+./client -i ./test.conf      # 前台启动客户端（压力测试，8线程 × 5000请求）
 
 ```
 
@@ -76,7 +66,7 @@ KrpcProvider (服务端网络层)    KrpcChannel (客户端网络层)
 - **`KrpcProvider`**：服务端核心。`NotifyService()` 注册 protobuf Service，`Run()` 启动 muduo TcpServer 并将服务注册到 ZooKeeper
 - **`KrpcChannel`**：客户端核心，继承自 `google::protobuf::RpcChannel`。`CallMethod()` 负责从 ZooKeeper 发现服务、通过连接池复用 TCP 连接、序列化请求/反序列化响应、故障重试
 - **`Krpccontroller`**：继承自 `google::protobuf::RpcController`，跟踪 RPC 调用状态和错误信息
-- **`ZkClient`**：ZooKeeper 客户端封装，提供 `GetData()`/`GetChildren()`/`GetChildrenWithWatcher()`/`Create()` 方法
+- **`ZkClient`**：ZooKeeper 客户端封装，提供 `GetData()`/`GetChildrenWithWatcher()`/`Create()` 方法。`Start()` 用条件变量等待 ZK 连接成功
 
 ### 自定义协议格式
 
@@ -103,7 +93,7 @@ ZooKeeper 路径结构：`/服务名/方法名/ip:port`
 1. **Watcher 推送**：`GetChildrenWithWatcher()` 注册子节点变化监听，ZK 节点变更时回调 `ChildWatcher` 设置脏标记 `m_providers_dirty`，下次 `CallMethod` 时触发刷新
 2. **定时兜底**：每 10 秒强制刷新一次，防止 watcher 丢失
 
-**连接池：** 每个 `KrpcChannel` 维护 `m_conn_pool`（key = `"ip:port"`），连接建立后复用。多实例场景下每次调用后断开当前连接，促使下次重新选节点，实现随机负载均衡。
+**连接池：** 每个 `KrpcChannel` 维护 `m_conn_pool`（key = `"ip:port"`）。`CallMethod` 每次通过 `ConnectToAvailableProvider` 随机选择存活节点后优先查池复用已有连接；单实例和多实例均复用。失败时 `RemoveFromPool` 关闭坏连接；`RefreshProviders` 刷新后同步清理池中已下线实例的失效连接。
 
 **故障隔离：** 3 秒内不重试已失败的节点（`ProviderAlive()` 检查）。`RefreshProviders()` 保留旧节点的故障状态。
 
@@ -124,7 +114,7 @@ service->CallMethod(method, nullptr, request, response, done)
 `stub.Login(...)` → protobuf Stub 转发 → `KrpcChannel::CallMethod()`：
 1. 服务发现（ZK/连接池）→ 2. 序列化请求 → 3. 打包 `[TotalLen][HeaderLen][Header][Args]` → 4. send → 5. recv_exact 收响应 → 6. 反序列化
 
-最多 2 次重试（`for (int attempt = 0; attempt < 2; ++attempt)`），任何步骤失败：标记节点 failed → 从连接池移除 → `continue` 重试不同存活节点。多实例调用成功后主动从池中移除当前连接，促使下次随机选不同节点。
+最多 2 次重试（`for (int attempt = 0; attempt < 2; ++attempt)`），任何步骤失败：标记节点 failed → 从连接池移除坏连接 → `continue` 重试不同存活节点。
 
 ### 添加新 RPC 服务的流程
 
