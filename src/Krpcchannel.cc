@@ -85,15 +85,11 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
     EnsureZkClient();
 
     for (int attempt = 0; attempt < 2; ++attempt) {
-        // 从连接池获取当前提供者的 fd
-        int fd = GetPooledFd(m_ip, m_port);
-        if (fd < 0) {
-            if (!ConnectToAvailableProvider(m_zkclient.get(), service_name, method_name)) {
-                controller->SetFailed("no available service provider");
-                return;
-            }
-            fd = GetPooledFd(m_ip, m_port);
+        if (!ConnectToAvailableProvider(m_zkclient.get(), service_name, method_name)) {
+            controller->SetFailed("no available service provider");
+            return;
         }
+        int fd = GetPooledFd(m_ip, m_port);
 
         // 序列化请求参数
         std::string args_str;
@@ -159,10 +155,6 @@ void KrpcChannel::CallMethod(const ::google::protobuf::MethodDescriptor *method,
             continue;
         }
 
-        // 多实例：从池中移除（下次调用重新选节点，实现负载均衡）
-        if (m_providers.size() > 1) {
-            RemoveFromPool(m_ip, m_port);
-        }
         return;
     }
 
@@ -269,6 +261,22 @@ bool KrpcChannel::RefreshProviders(ZkClient *zkclient, const std::string &servic
     }
 
     m_providers = std::move(next_providers);
+    // 清理连接池中已不在 provider 列表的失效连接（如实例已下线）
+    {
+        std::unordered_map<std::string, int> cleaned_pool;
+        for (auto &p : m_providers) {
+            auto it = m_conn_pool.find(PoolKey(p.ip, p.port));
+            if (it != m_conn_pool.end()) {
+                cleaned_pool[it->first] = it->second;
+            }
+        }
+        for (auto &kv : m_conn_pool) {
+            if (cleaned_pool.find(kv.first) == cleaned_pool.end()) {
+                close(kv.second);
+            }
+        }
+        m_conn_pool = std::move(cleaned_pool);
+    }
     m_last_refresh_time = std::chrono::steady_clock::now();
     m_providers_dirty = false;  // 刷新完成，清除脏标记
     if (m_provider_index >= m_providers.size()) {

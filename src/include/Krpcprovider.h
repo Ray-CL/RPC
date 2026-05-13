@@ -10,6 +10,7 @@
 #include<functional>
 #include<string>
 #include<unordered_map>
+#include<atomic>
 
 class KrpcProvider
 {
@@ -27,6 +28,8 @@ private:
         std::unordered_map<std::string, const google::protobuf::MethodDescriptor*> method_map;
     };
     std::unordered_map<std::string, ServiceInfo>service_map;//保存服务对象和rpc方法
+    std::atomic<int> m_request_count{0};   // 处理请求计数
+    int m_port = 0;                        // 记录服务端口
     
     void OnConnection(const muduo::net::TcpConnectionPtr& conn);
     void OnMessage(const muduo::net::TcpConnectionPtr& conn, muduo::net::Buffer* buffer, muduo::Timestamp receive_time);

@@ -51,6 +51,7 @@ void KrpcProvider::Run() {
       KrpcApplication::GetInstance().GetConfig().Load("rpcserverip");
   int port = atoi(
       KrpcApplication::GetInstance().GetConfig().Load("rpcserverport").c_str());
+  m_port = port;  // 记录端口，退出时打印计数用
 
   // 使用muduo网络库，创建地址对象
   muduo::net::InetAddress address(ip, port);
@@ -196,9 +197,8 @@ void KrpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn,
             this, &KrpcProvider::SendRpcResponse, conn, response);
 
     service->CallMethod(method, nullptr, request, response, done);
+    m_request_count++;  // 处理请求计数
     // CallMethod 是虚函数。service 的静态类型是 google::protobuf::Service*，
-    //  但它实际指向子类 UserService 对象。但等等——UserService自己没有重写
-    //  CallMethod，它继承自 UserServiceRpc，protobuf 生成的
     //   UserServiceRpc::CallMethod 里用 switch 分发
   }
 }
@@ -228,6 +228,7 @@ void KrpcProvider::SendRpcResponse(const muduo::net::TcpConnectionPtr &conn,
 
 // 析构函数，退出事件循环
 KrpcProvider::~KrpcProvider() {
-  std::cout << "~KrpcProvider()" << std::endl;
+  std::cout << "~KrpcProvider() 端口:" << m_port
+            << " 处理请求数:" << m_request_count.load() << std::endl;
   event_loop.quit(); // 退出事件循环
 }
